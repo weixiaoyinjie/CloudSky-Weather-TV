@@ -14,24 +14,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare project (source tree or single ZIP upload)
+      - name: Prepare project (source files or ZIP)
         shell: bash
         run: |
           set -euo pipefail
           if [[ -f "$GITHUB_WORKSPACE/settings.gradle" && -f "$GITHUB_WORKSPACE/app/build.gradle" ]]; then
             PROJECT_DIR="$GITHUB_WORKSPACE"
           else
-            ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -name 'CloudSky-Weather-TV-v1-OneUpload.zip' -print -quit)"
+            ZIP_FILE=""
+            # Prefer the corrected source ZIP if both versions are uploaded.
+            for filename in CloudSky-Weather-TV-v1.1-OneUpload.zip CloudSky-Weather-TV-v1-OneUpload.zip; do
+              candidate="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -type f -name "$filename" -print -quit)"
+              if [[ -n "$candidate" ]]; then ZIP_FILE="$candidate"; break; fi
+            done
             if [[ -z "$ZIP_FILE" ]]; then
-              echo '::error::Upload CloudSky-Weather-TV-v1-OneUpload.zip to repository root.'
+              echo '::error::Upload CloudSky-Weather-TV-v1.1-OneUpload.zip (or v1 ZIP) to the repository root.'
               exit 1
             fi
+            echo "Using source ZIP: $ZIP_FILE"
             PROJECT_DIR="$RUNNER_TEMP/cloudsky-weather-tv"
             mkdir -p "$PROJECT_DIR"
             unzip -q "$ZIP_FILE" -d "$PROJECT_DIR"
           fi
-          test -f "$PROJECT_DIR/settings.gradle" || { echo '::error::settings.gradle not found'; exit 1; }
-          test -f "$PROJECT_DIR/app/build.gradle" || { echo '::error::app/build.gradle not found'; exit 1; }
+          test -f "$PROJECT_DIR/settings.gradle" || { echo '::error::settings.gradle is missing'; exit 1; }
+          test -f "$PROJECT_DIR/app/build.gradle" || { echo '::error::app/build.gradle is missing'; exit 1; }
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       - name: Java 17
@@ -40,13 +46,42 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android 35 components
+      # GitHub-hosted ubuntu-24.04 runners ship Android SDK 35 and Build Tools 35.
+      # Avoid android-actions/setup-android@v3: that action attempts a new
+      # command-line-tools download/license refresh even when the SDK is present.
+      - name: Use preinstalled Android SDK (no setup-android action)
         shell: bash
         run: |
-          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [[ ! -d "$SDK" ]]; then
+            echo "::error::Android SDK directory not found: $SDK"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK/build-tools/35.0.0" >> "$GITHUB_PATH"
+          echo "Android SDK: $SDK"
+
+          # On GitHub-hosted runners these should already be installed.
+          # Install only if runner image changes and a component is missing.
+          if [[ ! -f "$SDK/platforms/android-35/android.jar" || ! -f "$SDK/build-tools/35.0.0/aapt2" ]]; then
+            SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+            if [[ ! -x "$SDKMANAGER" ]]; then
+              SDKMANAGER="$(command -v sdkmanager || true)"
+            fi
+            if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
+              echo '::error::Preinstalled SDK is incomplete and sdkmanager was not found.'
+              exit 1
+            fi
+            echo 'Missing Android 35 component; attempting installation with preinstalled sdkmanager.'
+            "$SDKMANAGER" --sdk_root="$SDK" --install 'platforms;android-35' 'build-tools;35.0.0'
+          fi
+
+          [[ -f "$SDK/platforms/android-35/android.jar" ]] || { echo '::error::Android 35 platform not available'; exit 1; }
+          [[ -f "$SDK/build-tools/35.0.0/aapt2" ]] || { echo '::error::Android Build Tools 35.0.0 not available'; exit 1; }
+          echo 'Android SDK 35 / Build Tools 35.0.0 verified.'
 
       - name: Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
@@ -58,11 +93,13 @@ jobs:
         run: |
           set -euo pipefail
           gradle --no-daemon --stacktrace -p "$PROJECT_DIR" :app:assembleDebug
-          cp "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" "$GITHUB_WORKSPACE/CloudSky-Weather-TV-v1.apk"
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK" || { echo '::error::APK missing after Gradle build'; exit 1; }
+          cp "$APK" "$GITHUB_WORKSPACE/CloudSky-Weather-TV-v1.1.apk"
 
       - name: Upload TV APK
         uses: actions/upload-artifact@v4
         with:
-          name: CloudSky-Weather-TV-v1-APK
-          path: CloudSky-Weather-TV-v1.apk
+          name: CloudSky-Weather-TV-v1.1-APK
+          path: CloudSky-Weather-TV-v1.1.apk
           if-no-files-found: error
